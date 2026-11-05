@@ -1,5 +1,5 @@
 /**
- * e-meter.ino
+ * firmware.ino
  *
  * Outputs JSON frames at 20 Hz via:
  *   • Serial  (always on, 115200 baud)
@@ -33,10 +33,13 @@
  *   The coin cell keeps time when WiFi is off.
  *
  * RTC time anchor
- *   On boot the sketch prints one line to Serial:
- *     [rtc] unix_at_boot=<epoch> t_ms_at_boot=<millis>
+ *   Every frame's "t" is milliseconds since t0, the moment streaming starts.
+ *   Once per boot (after WiFi/NTP has had a moment to sync the RTC) the
+ *   sketch reads the RTC and prints one line to Serial:
+ *     [rtc] unix_at_t0=<epoch>
  *   The client can reconstruct unix time for any frame as:
- *     unix = unix_at_boot + (frame.t - t_ms_at_boot) / 1000
+ *     unix = unix_at_t0 + frame.t / 1000
+ *   The SD file uses the same anchor, so live and recorded timestamps agree.
  *
  * SD recording
  *   When USE_SD is defined, flipping the toggle at the top of the sketch
@@ -104,9 +107,15 @@ PCF8563 rtc;
 struct State {
   float    uS;        // raw conductance in µS — cached by next_frame, reused by loop()
   uint32_t count;
-  uint32_t t0_ms;
+  uint32_t t0_ms;     // millis() at stream start
+  uint32_t t_ms;      // this frame's time (ms since t0) — shared by JSON + SD
 };
 static State g_state;
+
+// Unix seconds (UTC) at t0, from the RTC. 0 = RTC had no valid time.
+// Integer on purpose: a float has only ~24 bits of mantissa, which at
+// today's epoch (~1.8e9) means 128-second steps.
+static uint32_t g_unix_at_t0 = 0;
 
 // ── Polygram ring buffer ──────────────────────────────────────────────────────
 PolyPoint g_poly[POLY_MAX];
@@ -133,7 +142,6 @@ int       g_poly_len  = 0;
   static File     g_srt_file;
   static uint32_t g_srt_index   = 0;
   static int      g_unflushed   = 0;
-  static uint32_t g_unix_at_rec = 0;
 
   // ── ms → SRT timecode  HH:MM:SS,mmm ─────────────────────────────────────
   static void ms_to_tc(char* buf, size_t len, uint32_t ms) {
@@ -170,7 +178,6 @@ int       g_poly_len  = 0;
 
     g_srt_index   = 0;
     g_unflushed   = 0;
-    g_unix_at_rec = rtc.isRunning() ? rtc.getUnixTime() : 0;
     g_recording   = true;
     Serial.print("[sd] recording → "); Serial.println(path);
     display_splash_status("sd recording");
@@ -188,12 +195,15 @@ int       g_poly_len  = 0;
 
     char block[128];
     int n;
-    if (g_unix_at_rec > 0) {
-      float unix_f = (float)g_unix_at_rec + (float)t_ms / 1000.0f;
+    if (g_unix_at_t0 > 0) {
+      // integer seconds + integer ms: exact, no float rounding
+      uint32_t unix_s  = g_unix_at_t0 + t_ms / 1000;
+      uint32_t unix_ms = t_ms % 1000;
       n = snprintf(block, sizeof(block),
-                   "%lu\n%s --> %s\n%.3f | %.4f\n\n",
+                   "%lu\n%s --> %s\n%lu.%03lu | %.4f\n\n",
                    (unsigned long)g_srt_index,
-                   tc_start, tc_end, unix_f, uS);
+                   tc_start, tc_end,
+                   (unsigned long)unix_s, (unsigned long)unix_ms, uS);
     } else {
       n = snprintf(block, sizeof(block),
                    "%lu\n%s --> %s\n%.4f\n\n",
@@ -315,7 +325,10 @@ int       g_poly_len  = 0;
   bool                      g_bleConnected = false;
   class BLECallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer*)    { g_bleConnected = true;  }
-    void onDisconnect(BLEServer*) { g_bleConnected = false; }
+    void onDisconnect(BLEServer* server) {
+      g_bleConnected = false;
+      server->startAdvertising();   // stay discoverable so the client can reconnect
+    }
   };
   void ble_init() {
     BLEDevice::init("emeter");
@@ -354,6 +367,7 @@ String next_frame(State& s) {
   s.count++;
 
   uint32_t t_ms = millis() - s.t0_ms;
+  s.t_ms        = t_ms;
   s.uS          = adc_to_uS(raw);
 
   char buf[64];
@@ -388,6 +402,8 @@ void push_poly(float uS) {
 //  Pushes synced UTC time into the PCF8563 hardware RTC.
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef USE_WIFI
+static volatile bool g_ntp_synced = false;
+
 void sntp_sync_rtc(struct timeval* tv) {
   time_t    now = tv->tv_sec;
   struct tm t;
@@ -401,6 +417,7 @@ void sntp_sync_rtc(struct timeval* tv) {
   rtc.setDateTime(dt);
   Serial.printf("[ntp] RTC synced → %04d-%02d-%02d %02d:%02d:%02d\n",
                 dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+  g_ntp_synced = true;
 }
 #endif
 
@@ -421,8 +438,7 @@ void setup() {
   } else if (!rtc.isRunning()) {
     Serial.println("[rtc] not set — will sync via NTP on WiFi connect");
   } else {
-    Serial.printf("[rtc] unix_at_boot=%lu t_ms_at_boot=%lu\n",
-                  rtc.getUnixTime(), millis());
+    Serial.println("[rtc] running");
   }
 
   // OLED + display
@@ -435,7 +451,7 @@ void setup() {
   analogSetAttenuation(ADC_11db);
 
   // Init state (no smoothing, so no seed/warmup needed)
-  g_state = { 0.0f, 0, millis() };
+  g_state = { 0.0f, 0, millis(), 0 };
 
 #ifdef USE_WIFI
   ws_init();
@@ -443,6 +459,29 @@ void setup() {
 #ifdef USE_BLE
   ble_init();
 #endif
+
+#ifdef USE_WIFI
+  // Give SNTP a moment to correct the RTC before we anchor the session.
+  // Skipped instantly when offline; capped at 3 s otherwise.
+  {
+    uint32_t tw = millis();
+    while (WiFi.status() == WL_CONNECTED && !g_ntp_synced && millis() - tw < 3000) {
+      delay(50);
+    }
+  }
+#endif
+
+  // One time anchor for the whole session: read the RTC, then start the
+  // frame clock immediately. Live frames and SD frames both derive unix
+  // time from this pair, so they are internally consistent.
+  {
+    uint32_t u = rtc.getUnixTime();
+    g_unix_at_t0 = (rtc.isRunning() && u > 1704067200UL) ? u : 0;   // > 2024-01-01
+    g_state.t0_ms = millis();
+    g_state.count = 0;
+    Serial.printf("[rtc] unix_at_t0=%lu\n", (unsigned long)g_unix_at_t0);
+  }
+
 #ifdef USE_SD
   sd_init(SD_RECORD_ON_BOOT);
 #endif
@@ -462,7 +501,7 @@ void loop() {
 #endif
 
   String   json = next_frame(g_state);
-  uint32_t t_ms = millis() - g_state.t0_ms;
+  uint32_t t_ms = g_state.t_ms;   // same timestamp the JSON frame carries
 
   push_poly(g_state.uS);
 
