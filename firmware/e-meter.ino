@@ -87,11 +87,8 @@ static const float ADC_MAX      = 4095.0f;
 static const int   ADC_CLAMP_LO = 1;
 static const int   ADC_CLAMP_HI = 4094;
 
-// ── Smoothing / timing ───────────────────────────────────────────────────────
-// Single exponential moving average on the raw ADC reading.
-// Lower EMA_ALPHA (toward ~0.02) = smoother; higher (toward ~0.2) = more responsive.
-static const float    EMA_ALPHA   = 0.2f;
-static const int      WARMUP_SAMP = 40;       // ~2 s at 20 Hz; one EMA settles quickly
+// ── Timing ───────────────────────────────────────────────────────────────────
+// No smoothing: each frame is a single raw ADC read converted to µS.
 static const uint32_t PERIOD_US   = 50000;    // 20 Hz
 
 // ── OLED ─────────────────────────────────────────────────────────────────────
@@ -105,8 +102,7 @@ PCF8563 rtc;
 
 // ── Sensor state ─────────────────────────────────────────────────────────────
 struct State {
-  float    smoothed;  // EMA of raw ADC counts
-  float    uS;        // conductance in µS — cached by next_frame, reused by loop()
+  float    uS;        // raw conductance in µS — cached by next_frame, reused by loop()
   uint32_t count;
   uint32_t t0_ms;
 };
@@ -355,14 +351,13 @@ float adc_to_uS(int raw) {
 String next_frame(State& s) {
   int raw = analogRead(ADC_PIN);
 
-  s.smoothed = EMA_ALPHA * raw + (1.0f - EMA_ALPHA) * s.smoothed;
   s.count++;
 
   uint32_t t_ms = millis() - s.t0_ms;
-  s.uS          = adc_to_uS((int)s.smoothed);
+  s.uS          = adc_to_uS(raw);
 
   char buf[64];
-  snprintf(buf, sizeof(buf), "{\"t\":%lu,\"smooth_uS\":%.2f}",
+  snprintf(buf, sizeof(buf), "{\"t\":%lu,\"uS\":%.2f}",
            (unsigned long)t_ms, s.uS);
   return String(buf);
 }
@@ -439,21 +434,8 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
-  // Seed state
-  int seed = analogRead(ADC_PIN);
-  g_state = { (float)seed, 0.0f, 0, millis() };
-
-  // Warmup — let the EMA settle
-  Serial.println("[emeter] warming up...");
-  display_splash_status("warming up...");
-  for (int i = 0; i < WARMUP_SAMP; i++) {
-    next_frame(g_state);
-    delayMicroseconds(PERIOD_US);
-  }
-  g_state.count = 0;
-  g_state.t0_ms = millis();
-  Serial.println("[emeter] warmup done");
-  display_splash_status("warmup done");
+  // Init state (no smoothing, so no seed/warmup needed)
+  g_state = { 0.0f, 0, millis() };
 
 #ifdef USE_WIFI
   ws_init();
