@@ -1,20 +1,20 @@
 /**
  * display.h
  *
- * All OLED output for e-meter.ino.
+ * All OLED output for firmware.ino.
  * Cycle display modes with the button on the XIAO Expansion Board (D1).
  *
  * Modes:
  *   0  DISP_POLYGRAM  — full-screen 30-second rolling waveform
  *   1  DISP_NUMBERS   — µS + clock + status icons + min/max + waveform strip
  *
- * Public API (call from e-meter.ino):
+ * Public API (call from firmware.ino):
  *   display_splash()               — boot screen, call after u8g2.begin()
  *   display_splash_status(msg)     — update the status line on the boot screen
  *   display_setup()                — wires up button ISR, call after display_splash()
  *   display_render(uS, dt, unix_t) — render current mode, call every loop()
  *
- * Externs required in e-meter.ino (must NOT be static):
+ * Externs required in firmware.ino (must NOT be static):
  *   PolyPoint g_poly[POLY_MAX];
  *   int       g_poly_head;
  *   int       g_poly_len;
@@ -36,13 +36,13 @@
 // ── PolyPoint ─────────────────────────────────────────────────────────────────
 struct PolyPoint { uint32_t t_ms; float uS; };
 
-// ── Externs — defined in e-meter.ino ─────────────────────────────────────────
+// ── Externs — defined in firmware.ino ─────────────────────────────────────────
 extern U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2;
 extern PolyPoint g_poly[];
 extern int       g_poly_head;
 extern int       g_poly_len;
 
-// Transport state externs — conditionally compiled to match e-meter.ino
+// Transport state externs — conditionally compiled to match firmware.ino
 #ifdef USE_SD
   extern bool g_recording;
 #endif

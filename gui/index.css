@@ -1,0 +1,81 @@
+body {
+  background: #111;
+  color: #ddd;
+  font-family: monospace;
+  text-align: center;
+}
+
+main {
+  max-width: 400px;
+  margin: 0 auto;
+}
+
+#meter {
+  width: 320px;
+  height: 180px;
+  margin: 40px auto;
+  position: relative;
+}
+
+#needle {
+  width: 2px;
+  height: 125px;
+  background: red;
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform-origin: bottom center;
+}
+
+.controls {
+  margin-top: 20px;
+}
+
+label {
+  display: block;
+  margin: 10px;
+}
+
+#poly {
+  display: block;
+  width: 320px;
+  height: 80px;
+  margin: 24px auto 14px;
+}
+
+.btn {
+  background: none;
+  border: 1px solid #555;
+  border-radius: 4px;
+  color: #888;
+  font-family: monospace;
+  font-size: 1em;
+  cursor: pointer;
+  padding: 4px 14px;
+  transition: border-color 0.1s, color 0.1s;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: #aaa;
+  color: #ddd;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn.on {
+  border-color: #4c4;
+  color: #4c4;
+}
+
+.btn.scanning {
+  border-color: #cc4;
+  color: #cc4;
+}
+
+.btn.error {
+  border-color: #c44;
+  color: #c44;
+}

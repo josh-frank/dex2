@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>e meter</title>
+  <link rel="stylesheet" type="text/css" href="index.css">
+</head>
+
+<body>
+
+  <main>
+
+    <div id="meter">
+      <div id="needle"></div>
+    </div>
+
+    <div class="controls">
+      <label>
+        Tone Arm (scroll)
+        <br>
+        <input id="ta" type="range" min="-5" max="5" step="0.01" value="0">
+      </label>
+      <label>
+        Sensitivity (zoom)
+        <br>
+        <input id="sens" type="range" min="0.01" max="4" step="0.01" value="2">
+      </label>
+    </div>
+
+    <canvas id="poly" width="320" height="80"></canvas>
+
+    <button id="ble-btn" class="btn">disconnected</button>
+
+  </main>
+
+  <script>
+    // ── UUIDs (match ESP32 firmware) ──
+    const BLE_SERVICE_UUID = "454d4554-0000-1000-8000-00805f9b34fb";
+    const BLE_CHAR_UUID    = "454d4554-4552-4c45-8d41-52454144494e";
+
+    // Frames from the firmware: {"t": <ms since stream start>, "uS": <raw µS>}
+
+    // ── Controls ──
+    let toneArm = 0;
+    let sensitivity = 2;
+    document.getElementById("ta").oninput   = e => { toneArm     = parseFloat(e.target.value); };
+    document.getElementById("sens").oninput = e => { sensitivity = parseFloat(e.target.value); };
+
+    // ── Needle ──
+    // dt-aware EMAs: rates are defined in real seconds regardless of BLE jitter.
+    const needle = document.getElementById("needle");
+    const SMOOTH_TAU_S   = 0.15;   // fast tracker: needle responsiveness
+    const BASELINE_TAU_S = 20;     // slow tonic tracker: "where is home"
+
+    let smooth = null;
+    let baseline = null;
+    let lastT = null;
+
+    function updateNeedle(uS, t) {
+      const dt = lastT === null ? 0.05 : Math.max((t - lastT) / 1000, 0.001);
+      lastT = t;
+
+      if (smooth === null)   smooth = uS;
+      if (baseline === null) baseline = uS;
+
+      smooth   += (uS - smooth)   * Math.min(dt / SMOOTH_TAU_S, 1);
+      baseline += (uS - baseline) * Math.min(dt / BASELINE_TAU_S, 1);
+
+      const drive = (smooth - baseline) * sensitivity;
+      const final = Math.max(-1, Math.min(1, -drive + toneArm));
+      const angle = -90 + (final + 1) * 90;
+      needle.style.transform = `rotate(${angle}deg)`;
+    }
+
+    // ── Polygram (canvas, 30 s rolling window of raw µS) ──
+    const WINDOW_MS = 30000;
+    const W = 320, H = 80;
+
+    const polyCanvas = document.getElementById("poly");
+    const ctx = polyCanvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    polyCanvas.width  = W * dpr;
+    polyCanvas.height = H * dpr;
+    ctx.scale(dpr, dpr);
+
+    let polyData = [];          // { t (firmware ms), uS }
+    let polyMin = Infinity;
+    let polyMax = -Infinity;
+    let latestT = null;         // firmware t of newest sample
+    let latestPerf = 0;         // performance.now() when it arrived
+
+    function updatePolygram(uS, t) {
+      latestT = t;
+      latestPerf = performance.now();
+      polyData.push({ t, uS });
+
+      const cutoff = t - WINDOW_MS;
+      let drop = 0;
+      while (drop < polyData.length && polyData[drop].t < cutoff) drop++;
+
+      if (drop > 0) {
+        polyData.splice(0, drop);
+        polyMin = Infinity; polyMax = -Infinity;
+        for (const p of polyData) {
+          if (p.uS < polyMin) polyMin = p.uS;
+          if (p.uS > polyMax) polyMax = p.uS;
+        }
+      } else {
+        if (uS < polyMin) polyMin = uS;
+        if (uS > polyMax) polyMax = uS;
+      }
+    }
+
+    function renderPolygram() {
+      requestAnimationFrame(renderPolygram);
+      ctx.clearRect(0, 0, W, H);
+      if (polyData.length < 2) return;
+
+      // Sample spacing comes from the firmware clock (jitter-free); only the
+      // scroll head is advanced locally so it keeps moving between frames.
+      const nowT = latestT + (performance.now() - latestPerf);
+
+      const pad = Math.max((polyMax - polyMin) * 0.2, 2);
+      const lo = polyMin - pad;
+      const range = (polyMax + pad - lo) || 1;
+
+      const toY = v => H * (1 - (v - lo) / range);
+      const toX = t => W * (1 - (nowT - t) / WINDOW_MS);
+
+      ctx.beginPath();
+      ctx.strokeStyle = "red";
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      for (let i = 0; i < polyData.length; i++) {
+        const x = toX(polyData[i].t);
+        const y = toY(polyData[i].uS);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    renderPolygram();
+
+    // ── Frame handling ──
+    function resetState() {
+      smooth = null;
+      baseline = null;
+      lastT = null;
+      polyData = [];
+      polyMin = Infinity;
+      polyMax = -Infinity;
+      latestT = null;
+    }
+
+    function handleFrame(f) {
+      const uS = f.uS;
+      if (uS == null) return;
+      const t = f.t ?? performance.now();
+      if (lastT !== null && t < lastT) resetState();   // firmware rebooted
+      updateNeedle(uS, t);
+      updatePolygram(uS, t);
+    }
+
+    // ── BLE ──
+    const bleBtn = document.getElementById("ble-btn");
+    let bleDevice = null;
+    let bleChar = null;
+    let intentionalDisconnect = false;
+
+    let boundDisconnectHandler = null;
+    let boundCharHandler = null;
+
+    function setBleStatus(text, cls) {
+      bleBtn.textContent = text;
+      bleBtn.classList.remove("on", "scanning", "error");
+      if (cls) bleBtn.classList.add(cls);
+    }
+
+    function charHandler(e) {
+      try { handleFrame(JSON.parse(new TextDecoder().decode(e.target.value))); } catch (_) { }
+    }
+
+    function bleCleanup() {
+      if (bleChar && boundCharHandler) {
+        bleChar.removeEventListener("characteristicvaluechanged", boundCharHandler);
+      }
+      if (bleDevice && boundDisconnectHandler) {
+        bleDevice.removeEventListener("gattserverdisconnected", boundDisconnectHandler);
+      }
+      bleChar = null;
+      boundCharHandler = null;
+      boundDisconnectHandler = null;
+    }
+
+    async function attachNotifications(server) {
+      const service = await server.getPrimaryService(BLE_SERVICE_UUID);
+      bleChar = await service.getCharacteristic(BLE_CHAR_UUID);
+      await bleChar.startNotifications();
+      boundCharHandler = charHandler;
+      bleChar.addEventListener("characteristicvaluechanged", boundCharHandler);
+    }
+
+    async function handleDisconnect() {
+      bleChar = null;
+      if (intentionalDisconnect) {
+        bleCleanup();
+        setBleStatus("disconnected", "");
+        bleBtn.disabled = false;
+        return;
+      }
+
+      for (let i = 1; i <= 3; i++) {
+        setBleStatus(`reconnecting (${i}/3)…`, "scanning");
+        bleBtn.disabled = true;
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const server = await bleDevice.gatt.connect();
+          await attachNotifications(server);
+          resetState();
+          setBleStatus("connected", "on");
+          bleBtn.disabled = false;
+          return;
+        } catch (_) { }
+      }
+
+      bleCleanup();
+      setBleStatus("disconnected", "");
+      bleBtn.disabled = false;
+    }
+
+    async function bleConnect() {
+      if (!navigator.bluetooth) {
+        setBleStatus("no web bluetooth", "error");
+        return;
+      }
+
+      if (bleDevice && bleDevice.gatt.connected) {
+        intentionalDisconnect = true;
+        bleDevice.gatt.disconnect();
+        return;
+      }
+
+      bleBtn.disabled = true;
+      setBleStatus("scanning…", "scanning");
+
+      try {
+        bleCleanup();
+        bleDevice = null;
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [BLE_SERVICE_UUID] }]
+        });
+
+        intentionalDisconnect = false;
+        boundDisconnectHandler = handleDisconnect;
+        bleDevice.addEventListener("gattserverdisconnected", boundDisconnectHandler);
+
+        setBleStatus("connecting…", "scanning");
+        const server = await bleDevice.gatt.connect();
+        await attachNotifications(server);
+
+        resetState();
+        setBleStatus("connected", "on");
+        bleBtn.disabled = false;
+
+      } catch (err) {
+        bleCleanup();
+        bleDevice = null;
+        setBleStatus(err.name === "NotFoundError" ? "cancelled" : err.message, "error");
+        bleBtn.disabled = false;
+      }
+    }
+
+    bleBtn.addEventListener("click", bleConnect);
+  </script>
+
+</body>
+
+</html>
